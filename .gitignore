@@ -1,2 +1,5 @@
 dataset/
 quantum_features/
+implementation/logs_and_models
+/implementation/venv
+./implementation/evaluation_results

@@ -4,6 +4,8 @@ import time
 import numpy as np
 import logging
 import argparse
+import pickle
+import os
 from datetime import datetime
 from model import (
     build_qcnn_model,
@@ -21,14 +23,18 @@ from config import (
     LOCAL_EPOCHS,
     BATCH_SIZE,
     FEDERATED_DATA_PATH,
-    LOG_FILE,
 )
 
+# Create output directory for logs and models
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "logs_and_models")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 # Setup logging
+LOG_FILE_PATH = os.path.join(OUTPUT_DIR, "server_federated_training.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+    handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -311,13 +317,15 @@ class FederatedServer:
     def save_final_model(self):
         """Save the final global model."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = f"global_model_fednova_{timestamp}.h5"
+        model_path = os.path.join(OUTPUT_DIR, f"global_model_fednova_{timestamp}.h5")
 
         self.global_model.save(model_path)
         logger.info(f"Final global model saved to: {model_path}")
 
         # Also save weights separately using pickle (list of arrays)
-        weights_path = f"global_weights_fednova_{timestamp}.pkl"
+        weights_path = os.path.join(
+            OUTPUT_DIR, f"global_weights_fednova_{timestamp}.pkl"
+        )
         with open(weights_path, "wb") as f:
             pickle.dump(self.global_weights, f)
         logger.info(f"Global weights saved to: {weights_path}")

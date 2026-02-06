@@ -20,14 +20,18 @@ from config import (
     LOCAL_EPOCHS,
     BATCH_SIZE,
     FEDERATED_DATA_PATH,
-    LOG_FILE,
 )
 
+# Create output directory for logs
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "logs_and_models")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 # Setup logging
+LOG_FILE_PATH = os.path.join(OUTPUT_DIR, "client_federated_training.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(f"client_{LOG_FILE}"), logging.StreamHandler()],
+    handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -43,8 +47,8 @@ class FederatedClient:
         self.local_weights = None
         self.X_train = None
         self.y_train = None
-        self.X_val = None
-        self.y_val = None
+        self.X_test = None
+        self.y_test = None
         self.n_samples = 0
         self.steps_per_epoch = 0
 
@@ -77,16 +81,16 @@ class FederatedClient:
             raise FileNotFoundError(f"Train features not found: {train_features_path}")
 
         logger.info(f"Loading pre-extracted features from {train_features_path}")
-        
+
         self.X_train = np.load(train_features_path)
         self.y_train = np.load(train_labels_path)
         self.X_test = np.load(test_features_path)
         self.y_test = np.load(test_labels_path)
-        
+
         # No train_test_split needed - already split!
         self.n_samples = len(self.X_train)
         self.steps_per_epoch = (self.n_samples + BATCH_SIZE - 1) // BATCH_SIZE
-    
+
         logger.info(f"Loaded: {self.n_samples} train, {len(self.X_test)} test samples")
 
     def initialize_model(self):
@@ -138,7 +142,7 @@ class FederatedClient:
         history = self.local_model.fit(
             self.X_train,
             self.y_train,
-            validation_data=(self.X_val, self.y_val),
+            validation_data=(self.X_test, self.y_test),
             epochs=LOCAL_EPOCHS,
             batch_size=BATCH_SIZE,
             verbose=1,

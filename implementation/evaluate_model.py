@@ -14,6 +14,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 
+# Create output directory for evaluation results
+EVAL_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "evaluation_results")
+os.makedirs(EVAL_OUTPUT_DIR, exist_ok=True)
+
+CLASS_NAMES = ["MildDemented", "ModerateDemented", "NonDemented", "VeryMildDemented"]
+
 
 def evaluate_model(model_path, X_test, y_test, class_names=None):
     """
@@ -32,9 +38,30 @@ def evaluate_model(model_path, X_test, y_test, class_names=None):
     print("FEDERATED QCNN MODEL EVALUATION")
     print("=" * 70)
 
-    # Load model
+    # Load model (handle Keras version compatibility)
     print(f"\nLoading model from: {model_path}")
-    model = tf.keras.models.load_model(model_path)
+
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    try:
+        model = tf.keras.models.load_model(model_path, compile=False)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print("\nTrying alternative method...")
+
+        # Alternative: Load weights only
+        try:
+            from model import build_qcnn_model
+
+            model = build_qcnn_model()
+            model.load_weights(model_path)
+            print("Model weights loaded successfully!")
+        except Exception as e2:
+            print(f"Weight loading also failed: {e2}")
+            raise Exception("Could not load model. Check TensorFlow version.")
+
     print(f"Model loaded successfully!")
 
     # Get model summary
@@ -449,7 +476,10 @@ def main():
         help="Comma-separated class names",
     )
     parser.add_argument(
-        "--output", type=str, default=".", help="Output directory for plots and report"
+        "--output",
+        type=str,
+        default=EVAL_OUTPUT_DIR,
+        help="Output directory for plots and report",
     )
 
     args = parser.parse_args()
@@ -467,13 +497,24 @@ def main():
     if args.model is None:
         import glob
 
-        models = glob.glob("global_model_fednova_*.h5")
+        # Look in logs_and_models folder
+        logs_dir = os.path.join(os.path.dirname(__file__), "logs_and_models")
+        models = glob.glob(os.path.join(logs_dir, "global_model_fednova_*.h5"))
         if models:
             args.model = max(models, key=os.path.getmtime)
             print(f"Using latest model: {args.model}")
         else:
-            print("[FAIL] No model found! Please specify --model")
-            sys.exit(1)
+            # Try current directory
+            models = glob.glob("global_model_fednova_*.h5")
+            if models:
+                args.model = max(models, key=os.path.getmtime)
+                print(f"Using latest model: {args.model}")
+            else:
+                print("[FAIL] No model found! Please specify --model")
+                sys.exit(1)
+
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
 
     # Evaluate model
     results, model, y_pred, y_pred_proba = evaluate_model(
@@ -495,7 +536,7 @@ def main():
     print(f"   Accuracy: {results['test_accuracy'] * 100:.2f}%")
     print(f"   Loss: {results['test_loss']:.4f}")
     print(f"   F1-Score (Macro): {results['macro_metrics']['f1_score']:.4f}")
-    print(f"\n Output Files:")
+    print(f"\n Output Files saved to: {args.output}")
     print(f"   - Confusion Matrix")
     print(f"   - Per-Class Metrics")
     print(f"   - Accuracy by Class")
