@@ -3,6 +3,8 @@ import time
 import numpy as np
 import logging
 import argparse
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import class_weight
 import os
 from model import (
     build_qcnn_model,
@@ -139,12 +141,39 @@ class FederatedClient:
         """Perform local training on client data."""
         logger.info(f"Starting local training for {LOCAL_EPOCHS} epochs...")
 
+        # ---------------------------------------------------------
+        # FIX 1: FLATTEN & NORMALIZE (Crucial for Quantum Features)
+        # ---------------------------------------------------------
+        # Ensure data is 2D (samples, features)
+        X_train_processed = self.X_train
+        if len(X_train_processed.shape) > 2:
+            X_train_processed = X_train_processed.reshape(
+                X_train_processed.shape[0], -1
+            )
+
+        # Quantum features are small (-1 to 1). Neural nets need Mean=0, Std=1.
+        scaler = StandardScaler()
+        X_train_processed = scaler.fit_transform(X_train_processed)
+
+        # ---------------------------------------------------------
+        # FIX 2: CLASS WEIGHTS (Fixes the "Majority Class" Bias)
+        # ---------------------------------------------------------
+        # Calculate weights to penalize the model for ignoring small classes
+        unique_classes = np.unique(self.y_train)
+        weights = class_weight.compute_class_weight(
+            class_weight="balanced", classes=unique_classes, y=self.y_train
+        )
+        class_weights_dict = dict(zip(unique_classes, weights))
+
+        # Log the weights so you can verify it's working
+        logger.info(f"Class Weights applied: {class_weights_dict}")
         history = self.local_model.fit(
-            self.X_train,
+            X_train_processed,
             self.y_train,
             validation_data=(self.X_test, self.y_test),
             epochs=LOCAL_EPOCHS,
             batch_size=BATCH_SIZE,
+            class_weight=class_weights_dict,
             verbose=1,
         )
 

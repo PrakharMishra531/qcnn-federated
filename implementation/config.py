@@ -16,7 +16,7 @@ NUM_CLASSES = 4
 INPUT_DIM = (IMG_SIZE // PATCH_SIZE) ** 2 * NUM_QUBITS  # 1024 * 4 = 4096
 DENSE_LAYERS = [1024, 512, 256, 128]
 DROPOUT_RATES = [0.3, 0.25, 0.15, 0.0]
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001  #reduced to avoid collapse
 
 # Federated Configuration
 NUM_CLIENTS = 5
