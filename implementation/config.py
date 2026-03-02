@@ -19,13 +19,18 @@ DROPOUT_RATES = [0.3, 0.25, 0.15, 0.0]
 LEARNING_RATE = 0.0001  #reduced to avoid collapse
 
 # Federated Configuration
-NUM_CLIENTS = 5
-NUM_ROUNDS = 10
-LOCAL_EPOCHS = 20
+# NUM_CLIENTS = 5
+# NUM_ROUNDS = 10
+# LOCAL_EPOCHS = 20
+# BATCH_SIZE = 32
+
+NUM_CLIENTS = 1
+NUM_ROUNDS = 3
+LOCAL_EPOCHS = 5
 BATCH_SIZE = 32
 
 # Communication Configuration
-SERVER_HOST = "localhost"
+SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 8080
 BUFFER_SIZE = 104857600  # 100MB buffer for large model weights
 

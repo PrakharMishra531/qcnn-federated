@@ -5,6 +5,23 @@ import numpy as np
 import pickle
 from config import INPUT_DIM, NUM_CLASSES, DENSE_LAYERS, DROPOUT_RATES, LEARNING_RATE
 
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+def setup_gpu():
+    """Enable GPU memory growth to prevent Out-of-Memory errors on Jetson Nano."""
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"GPU detected: {len(gpus)} GPU(s) available")
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            print(f"GPU config error: {e}")
+    else:
+        print("No GPU detected. Running on CPU.")
+
+# Initialize GPU settings immediately
+setup_gpu()
 
 def build_qcnn_model(input_dim=None, num_classes=NUM_CLASSES):
     """
