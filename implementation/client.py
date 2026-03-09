@@ -1,27 +1,28 @@
+import argparse
+import logging
+import os
 import socket
 import time
+
 import numpy as np
-import logging
-import argparse
-from sklearn.preprocessing import StandardScaler
-from sklearn.utils import class_weight
-import os
-from model import (
-    build_qcnn_model,
-    get_flat_weights,
-    set_weights_from_flat,
-    serialize_weights,
-    deserialize_weights,
-    compute_weight_delta,
-)
 from config import (
+    BATCH_SIZE,
+    BUFFER_SIZE,
+    CHUNK_SIZE,
+    SOCKET_TIMEOUT,
+    FEDERATED_DATA_PATH,
+    LOCAL_EPOCHS,
+    NUM_ROUNDS,
     SERVER_HOST,
     SERVER_PORT,
-    BUFFER_SIZE,
-    NUM_ROUNDS,
-    LOCAL_EPOCHS,
-    BATCH_SIZE,
-    FEDERATED_DATA_PATH,
+)
+from model import (
+    build_qcnn_model,
+    compute_weight_delta,
+    deserialize_weights,
+    get_flat_weights,
+    serialize_weights,
+    set_weights_from_flat,
 )
 
 # Create output directory for logs
@@ -36,6 +37,97 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE_PATH), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers: chunked send/receive with ACK flow-control
+# (Must stay in sync with the identical helpers in server.py)
+# ---------------------------------------------------------------------------
+
+
+def _recv_exact(sock, num_bytes):
+    """Receive exactly num_bytes from sock. Raises ConnectionError on drop."""
+    buf = bytearray()
+    while len(buf) < num_bytes:
+        chunk = sock.recv(num_bytes - len(buf))
+        if not chunk:
+            raise ConnectionError(
+                f"Connection dropped: received {len(buf)}/{num_bytes} bytes."
+            )
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_chunked(sock, payload, chunk_size=CHUNK_SIZE):
+    """Send *payload* in chunks, waiting for a 3-byte ACK after each chunk.
+
+    Protocol (sender side):
+        1. Send 16-byte left-justified size header.
+        2. For each chunk:
+           a. sendall(chunk)
+           b. recv 3-byte ACK from receiver.
+    """
+    size = len(payload)
+    header = str(size).ljust(16).encode()
+    sock.sendall(header)
+
+    offset = 0
+    while offset < size:
+        end = min(offset + chunk_size, size)
+        sock.sendall(payload[offset:end])
+        # Wait for ACK before sending next chunk
+        ack = _recv_exact(sock, 3)
+        if ack != b"ACK":
+            raise ConnectionError(f"Expected ACK, got {ack!r}")
+        offset = end
+
+
+def recv_chunked(sock, chunk_size=CHUNK_SIZE, buffer_size=BUFFER_SIZE):
+    """Receive a chunked payload, sending a 3-byte ACK after each chunk.
+
+    Protocol (receiver side):
+        1. Receive 16-byte size header.
+        2. While bytes remaining:
+           a. recv up to min(chunk_size, remaining) bytes.
+           b. sendall(b'ACK').
+        3. Return complete payload bytes.
+    """
+    header = _recv_exact(sock, 16)
+    size = int(header.decode().strip())
+
+    data = bytearray()
+    while len(data) < size:
+        # How many bytes belong to the current chunk?
+        chunk_remaining = min(chunk_size, size - len(data))
+        # Receive the whole chunk (may arrive in several TCP segments)
+        while chunk_remaining > 0:
+            piece = sock.recv(min(buffer_size, chunk_remaining))
+            if not piece:
+                raise ConnectionError(
+                    f"Connection dropped: received {len(data)}/{size} bytes."
+                )
+            data.extend(piece)
+            chunk_remaining -= len(piece)
+        # Acknowledge this chunk
+        sock.sendall(b"ACK")
+
+    return bytes(data)
+
+
+def configure_socket(sock):
+    """Apply TCP_NODELAY, timeout, and enlarged buffers to *sock*."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(SOCKET_TIMEOUT)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    except OSError:
+        pass  # Some OS/containers do not allow enlarging buffers
+
+
+# ---------------------------------------------------------------------------
+# Federated Client
+# ---------------------------------------------------------------------------
 
 
 class FederatedClient:
@@ -57,8 +149,8 @@ class FederatedClient:
     def connect_to_server(self):
         """Connect to the federated learning server."""
         logger.info(f"Connecting to server at {self.server_host}:{self.server_port}...")
-
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        configure_socket(self.socket)
         self.socket.connect((self.server_host, self.server_port))
 
         # Receive client ID from server
@@ -66,7 +158,6 @@ class FederatedClient:
         assert client_id == self.client_id, (
             f"Expected client {self.client_id}, got {client_id}"
         )
-
         logger.info(f"Connected to server as Client {client_id}")
 
     def load_local_data(self):
@@ -83,16 +174,13 @@ class FederatedClient:
             raise FileNotFoundError(f"Train features not found: {train_features_path}")
 
         logger.info(f"Loading pre-extracted features from {train_features_path}")
-
         self.X_train = np.load(train_features_path)
         self.y_train = np.load(train_labels_path)
         self.X_test = np.load(test_features_path)
         self.y_test = np.load(test_labels_path)
 
-        # No train_test_split needed - already split!
         self.n_samples = len(self.X_train)
         self.steps_per_epoch = (self.n_samples + BATCH_SIZE - 1) // BATCH_SIZE
-
         logger.info(f"Loaded: {self.n_samples} train, {len(self.X_test)} test samples")
 
     def initialize_model(self):
@@ -101,49 +189,44 @@ class FederatedClient:
         self.local_model = build_qcnn_model()
         self.local_weights = get_flat_weights(self.local_model)
 
-    def receive_global_weights(self):
-        """Receive global model weights from server."""
-        logger.info("Waiting for global weights from server...")
-
+    def send_ready(self):
+        """Send READY signal to server after data load + model init."""
         try:
-            # Receive weight size
-            size_data = self.socket.recv(16).decode().strip()
-            if not size_data:
-                logger.error("Received empty size data from server")
-                return False
+            self.socket.sendall(b"READY   ")  # 8 bytes, padded with spaces
+            logger.info("Sent READY signal to server")
+        except Exception as e:
+            logger.error(f"Error sending READY: {e}")
 
-            size = int(size_data)
+    # ------------------------------------------------------------------
+    # Receive global weights (server -> client)  [chunked ACK protocol]
+    # ------------------------------------------------------------------
 
-            # Receive weights
-            data = b""
-            while len(data) < size:
-                chunk = self.socket.recv(min(BUFFER_SIZE, size - len(data)))
-                if not chunk:
-                    break
-                data += chunk
+    def receive_global_weights(self):
+        """Receive global model weights from server using chunked ACK protocol."""
+        logger.info("Waiting for global weights from server...")
+        try:
+            data = recv_chunked(self.socket)
 
             self.global_weights = deserialize_weights(data)
-
-            # Update local model with global weights
             self.local_model = set_weights_from_flat(
                 self.local_model, self.global_weights
             )
             self.local_weights = self.global_weights
 
-            logger.info(f"Received global weights: {size} bytes")
+            logger.info(f"Received global weights: {len(data):,} bytes")
             return True
-
         except Exception as e:
             logger.error(f"Error receiving global weights: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Local training  (no sklearn -- Nano-compatible)
+    # ------------------------------------------------------------------
 
     def train_locally(self):
         """Perform local training on client data."""
         logger.info(f"Starting local training for {LOCAL_EPOCHS} epochs...")
 
-        # ---------------------------------------------------------
-        # FIX 1: FLATTEN & NORMALIZE (Crucial for Quantum Features)
-        # ---------------------------------------------------------
         # Ensure data is 2D (samples, features)
         X_train_processed = self.X_train
         if len(X_train_processed.shape) > 2:
@@ -151,36 +234,42 @@ class FederatedClient:
                 X_train_processed.shape[0], -1
             )
 
-        # Quantum features are small (-1 to 1). Neural nets need Mean=0, Std=1.
-        scaler = StandardScaler()
-        X_train_processed = scaler.fit_transform(X_train_processed)
+        # Flatten test data the same way
+        X_test_processed = self.X_test
+        if len(X_test_processed.shape) > 2:
+            X_test_processed = X_test_processed.reshape(X_test_processed.shape[0], -1)
 
-        # ---------------------------------------------------------
-        # FIX 2: CLASS WEIGHTS (Fixes the "Majority Class" Bias)
-        # ---------------------------------------------------------
-        # Calculate weights to penalize the model for ignoring small classes
+        # Manual StandardScaler (no sklearn dependency on Nano)
+        mean = np.mean(X_train_processed, axis=0)
+        std = np.std(X_train_processed, axis=0)
+        std[std == 0] = 1e-7
+        X_train_processed = (X_train_processed - mean) / std
+        X_test_processed = (X_test_processed - mean) / std  # same transform
+
+        # Manual class weight computation (no sklearn dependency on Nano)
         unique_classes = np.unique(self.y_train)
-        weights = class_weight.compute_class_weight(
-            class_weight="balanced", classes=unique_classes, y=self.y_train
-        )
-        class_weights_dict = dict(zip(unique_classes, weights))
+        n_samples = len(self.y_train)
+        n_classes = len(unique_classes)
+        class_counts = np.bincount(self.y_train.astype(int))
+        class_weight_dict = {}
+        for cls in unique_classes:
+            cls_int = int(cls)
+            class_weight_dict[cls_int] = n_samples / (n_classes * class_counts[cls_int])
 
-        # Log the weights so you can verify it's working
-        logger.info(f"Class Weights applied: {class_weights_dict}")
+        logger.info(f"Class Weights applied: {class_weight_dict}")
+
         history = self.local_model.fit(
             X_train_processed,
             self.y_train,
-            validation_data=(self.X_test, self.y_test),
+            validation_data=(X_test_processed, self.y_test),
             epochs=LOCAL_EPOCHS,
             batch_size=BATCH_SIZE,
-            class_weight=class_weights_dict,
+            class_weight=class_weight_dict,
             verbose=1,
         )
 
-        # Get final local weights
         self.local_weights = get_flat_weights(self.local_model)
 
-        # Log training metrics
         final_train_acc = history.history["accuracy"][-1]
         final_val_acc = history.history["val_accuracy"][-1]
         final_train_loss = history.history["loss"][-1]
@@ -191,54 +280,50 @@ class FederatedClient:
         logger.info(f"  Validation accuracy: {final_val_acc:.4f}")
         logger.info(f"  Train loss: {final_train_loss:.4f}")
         logger.info(f"  Validation loss: {final_val_loss:.4f}")
-
         return history
+
+    # ------------------------------------------------------------------
+    # Compute & send update (client -> server)  [chunked ACK protocol]
+    # ------------------------------------------------------------------
 
     def compute_update(self):
         """Compute weight update (delta = local - global)."""
         logger.info("Computing weight update...")
-
         weight_delta = compute_weight_delta(self.local_weights, self.global_weights)
-
-        # Calculate number of local steps
         local_steps = LOCAL_EPOCHS * self.steps_per_epoch
 
         logger.info(
             f"Update computed: {len(weight_delta)} layers, "
             f"{local_steps} local steps, {self.n_samples} samples"
         )
-
         return weight_delta, local_steps
 
     def send_update(self, weight_delta, local_steps):
-        """Send weight update to server."""
+        """Send weight update to server using chunked ACK protocol.
+
+        Protocol:
+            1. 64-byte metadata: "n_samples,steps" (left-justified, padded)
+            2. Chunked weight-delta payload (with ACK flow-control)
+        """
         logger.info("Sending update to server...")
-
         try:
-            # Send metadata: n_samples, local_steps
+            # 1. 64-byte metadata
             metadata = f"{self.n_samples},{local_steps}"
-            self.socket.send(metadata.encode().ljust(64))
+            self.socket.sendall(metadata.ljust(64).encode())
 
-            # Serialize and send weight delta
+            # 2. Chunked payload
             serialized_delta = serialize_weights(weight_delta)
-            size = len(serialized_delta)
+            send_chunked(self.socket, serialized_delta)
 
-            # Send size first
-            self.socket.send(str(size).encode().ljust(16))
-
-            # Send data in chunks
-            sent = 0
-            while sent < size:
-                chunk = serialized_delta[sent : sent + BUFFER_SIZE]
-                self.socket.send(chunk)
-                sent += len(chunk)
-
-            logger.info(f"Update sent: {size} bytes")
+            logger.info(f"Update sent: {len(serialized_delta):,} bytes")
             return True
-
         except Exception as e:
             logger.error(f"Error sending update: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Main federated loop
+    # ------------------------------------------------------------------
 
     def run_federated_training(self):
         """Run the main federated learning loop on client side."""
@@ -246,45 +331,35 @@ class FederatedClient:
         logger.info(f"Client {self.client_id} Starting Federated Training")
         logger.info("=" * 60)
 
-        # Connect to server
         self.connect_to_server()
-
-        # Load local data
         self.load_local_data()
-
-        # Initialize model
         self.initialize_model()
+        self.send_ready()
 
-        # Federated training loop
         for round_num in range(1, NUM_ROUNDS + 1):
             logger.info(f"\n{'=' * 60}")
             logger.info(f"Round {round_num}/{NUM_ROUNDS}")
             logger.info(f"{'=' * 60}")
 
-            # Step 1: Receive global weights
+            # Receive global weights
             success = self.receive_global_weights()
             if not success:
-                logger.error("Failed to receive global weights. Skipping round.")
-                continue
+                logger.error("Failed to receive global weights. Aborting.")
+                break
 
-            # Step 2: Train locally
+            # Train locally
             self.train_locally()
 
-            # Step 3: Compute update
+            # Compute and send update
             weight_delta, local_steps = self.compute_update()
-
-            # Step 4: Send update to server
             success = self.send_update(weight_delta, local_steps)
             if not success:
-                logger.error("Failed to send update to server.")
-                continue
+                logger.error("Failed to send update to server. Aborting.")
+                break
 
-        # Training complete
         logger.info("=" * 60)
         logger.info("Federated training completed!")
         logger.info("=" * 60)
-
-        # Cleanup
         self.shutdown()
 
     def shutdown(self):
@@ -293,7 +368,7 @@ class FederatedClient:
             try:
                 self.socket.close()
                 logger.info("Socket connection closed")
-            except:
+            except Exception:
                 pass
 
 

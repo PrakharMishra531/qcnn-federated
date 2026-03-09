@@ -18,6 +18,8 @@ from config import (
     SERVER_HOST,
     SERVER_PORT,
     BUFFER_SIZE,
+    CHUNK_SIZE,
+    SOCKET_TIMEOUT,
     NUM_CLIENTS,
     NUM_ROUNDS,
     LOCAL_EPOCHS,
@@ -39,13 +41,103 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers: chunked send/receive with ACK flow-control
+# ---------------------------------------------------------------------------
+
+
+def _recv_exact(sock, num_bytes):
+    """Receive exactly num_bytes from sock. Raises ConnectionError on drop."""
+    buf = bytearray()
+    while len(buf) < num_bytes:
+        chunk = sock.recv(num_bytes - len(buf))
+        if not chunk:
+            raise ConnectionError(
+                f"Connection dropped: received {len(buf)}/{num_bytes} bytes."
+            )
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def send_chunked(sock, payload, chunk_size=CHUNK_SIZE):
+    """Send *payload* in chunks, waiting for a 3-byte ACK after each chunk.
+
+    Protocol (sender side):
+        1. Send 16-byte left-justified size header.
+        2. For each chunk:
+           a. sendall(chunk)
+           b. recv 3-byte ACK from receiver.
+    """
+    size = len(payload)
+    header = str(size).ljust(16).encode()
+    sock.sendall(header)
+
+    offset = 0
+    while offset < size:
+        end = min(offset + chunk_size, size)
+        sock.sendall(payload[offset:end])
+        # Wait for ACK before sending next chunk
+        ack = _recv_exact(sock, 3)
+        if ack != b"ACK":
+            raise ConnectionError(f"Expected ACK, got {ack!r}")
+        offset = end
+
+
+def recv_chunked(sock, chunk_size=CHUNK_SIZE, buffer_size=BUFFER_SIZE):
+    """Receive a chunked payload, sending a 3-byte ACK after each chunk.
+
+    Protocol (receiver side):
+        1. Receive 16-byte size header.
+        2. While bytes remaining:
+           a. recv up to min(chunk_size, remaining) bytes.
+           b. sendall(b'ACK').
+        3. Return complete payload bytes.
+    """
+    header = _recv_exact(sock, 16)
+    size = int(header.decode().strip())
+
+    data = bytearray()
+    while len(data) < size:
+        # How many bytes belong to the current chunk?
+        chunk_remaining = min(chunk_size, size - len(data))
+        # Receive the whole chunk (may arrive in several TCP segments)
+        while chunk_remaining > 0:
+            piece = sock.recv(min(buffer_size, chunk_remaining))
+            if not piece:
+                raise ConnectionError(
+                    f"Connection dropped: received {len(data)}/{size} bytes."
+                )
+            data.extend(piece)
+            chunk_remaining -= len(piece)
+        # Acknowledge this chunk
+        sock.sendall(b"ACK")
+
+    return bytes(data)
+
+
+def configure_socket(sock):
+    """Apply TCP_NODELAY, timeout, and enlarged buffers to *sock*."""
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(SOCKET_TIMEOUT)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    except OSError:
+        pass  # Some OS/containers do not allow enlarging buffers
+
+
+# ---------------------------------------------------------------------------
+# Federated Server
+# ---------------------------------------------------------------------------
+
+
 class FederatedServer:
     def __init__(self, host=SERVER_HOST, port=SERVER_PORT, num_clients=NUM_CLIENTS):
         self.host = host
         self.port = port
         self.num_clients = num_clients
         self.server_socket = None
-        self.clients = []
+        self.clients = []  # list of client sockets
         self.client_info = {}
         self.global_model = None
         self.global_weights = None
@@ -89,6 +181,9 @@ class FederatedServer:
                 client_socket, address = self.server_socket.accept()
                 connection_attempts += 1
 
+                # Tune the accepted client socket immediately
+                configure_socket(client_socket)
+
                 with self.lock:
                     client_id = connected_clients + 1
                     self.clients.append(client_socket)
@@ -97,10 +192,11 @@ class FederatedServer:
                         "connected": True,
                         "n_samples": 0,
                         "steps": 0,
+                        "ready": False,
                     }
 
                     # Send client ID
-                    client_socket.send(str(client_id).encode())
+                    client_socket.sendall(str(client_id).encode())
 
                     logger.info(f"Client {client_id} connected from {address}")
                     connected_clients += 1
@@ -118,68 +214,107 @@ class FederatedServer:
         else:
             logger.info(f"All {self.num_clients} clients connected successfully")
 
-    def broadcast_global_weights(self):
-        """Send current global model weights to all clients."""
-        logger.info("Broadcasting global model weights to clients...")
-        serialized_weights = serialize_weights(self.global_weights)
-        total_sent = 0
+        # Wait for all clients to be READY (data loaded, model initialized)
+        logger.info("Waiting for clients to be READY...")
+        self.wait_for_client_ready()
 
-        for i, client_socket in enumerate(self.clients):
+    def wait_for_client_ready(self):
+        """Wait for all clients to send READY signal (after data load + model init)."""
+        ready_count = 0
+
+        for idx, client_socket in enumerate(self.clients):
+            client_id = idx + 1
             try:
-                client_id = i + 1
-                # Send weight size first
-                size = len(serialized_weights)
-                client_socket.send(str(size).encode().ljust(16))
-
-                # Send weights in chunks if necessary
-                sent = 0
-                while sent < size:
-                    chunk = serialized_weights[sent : sent + BUFFER_SIZE]
-                    client_socket.send(chunk)
-                    sent += len(chunk)
-
-                total_sent += size
-                logger.debug(f"Sent {size} bytes to client {client_id}")
-
+                # Wait for READY message (8 bytes, padded)
+                ready_msg = _recv_exact(client_socket, 8)
+                msg = ready_msg.decode().strip()
+                if msg == "READY":
+                    ready_count += 1
+                    self.client_info[client_id]["ready"] = True
+                    logger.info(f"Client {client_id} is READY")
+                else:
+                    logger.warning(f"Unexpected message from client {client_id}: {msg}")
             except Exception as e:
-                logger.error(f"Error sending weights to client {client_id}: {e}")
+                logger.error(f"Error waiting for READY from client {client_id}: {e}")
+
+        logger.info(f"{ready_count}/{len(self.clients)} clients are READY")
+
+    # ------------------------------------------------------------------
+    # Weight broadcast (server -> clients)
+    # ------------------------------------------------------------------
+
+    def broadcast_global_weights(self):
+        """Broadcast the current global weights to all connected clients.
+
+        Uses chunked transfer with per-chunk ACK for flow control.
+        Each client is handled independently so one failure doesn't
+        affect the others.
+        """
+        logger.info("Broadcasting global model weights to clients...")
+
+        serialized_weights = serialize_weights(self.global_weights)
+        size = len(serialized_weights)
+        logger.info(f"Serialized weight payload: {size:,} bytes")
+
+        success_count = 0
+        failed_clients = []
+
+        for idx, client_socket in enumerate(self.clients):
+            client_id = idx + 1
+            try:
+                send_chunked(client_socket, serialized_weights)
+                success_count += 1
+                logger.info(f"  Sent weights to client {client_id}")
+            except Exception as e:
+                logger.error(f"  Error sending weights to client {client_id}: {e}")
                 self.client_info[client_id]["connected"] = False
+                failed_clients.append(client_id)
 
         logger.info(
-            f"Broadcast complete: {total_sent} bytes sent to {len(self.clients)} clients"
+            f"Broadcast complete: {size:,} bytes sent to "
+            f"{success_count}/{len(self.clients)} clients."
         )
 
+        # Remove failed clients so we don't wait for them later
+        for cid in failed_clients:
+            idx = cid - 1
+            try:
+                self.clients[idx].close()
+            except Exception:
+                pass
+
+        return success_count > 0
+
+    # ------------------------------------------------------------------
+    # Receive client updates (clients -> server)
+    # ------------------------------------------------------------------
+
     def receive_client_updates(self):
-        """Receive updates from all clients."""
+        """Receive updates from all connected clients.
+
+        Protocol per client:
+            1. 64-byte metadata: "n_samples,steps" (left-justified, padded)
+            2. Chunked weight-delta payload (with ACK flow-control)
+        """
         logger.info("Waiting for client updates...")
         received_updates = {}
         start_time = time.time()
 
-        for i, client_socket in enumerate(self.clients):
-            client_id = i + 1
+        for idx, client_socket in enumerate(self.clients):
+            client_id = idx + 1
+            if not self.client_info[client_id]["connected"]:
+                continue
 
             try:
-                # Receive metadata (n_samples, steps)
-                metadata = client_socket.recv(64).decode().strip()
+                # 1. 64-byte metadata
+                meta_raw = _recv_exact(client_socket, 64)
+                metadata = meta_raw.decode().strip()
                 n_samples, steps = map(int, metadata.split(","))
 
-                # Receive weight update size
-                size_data = client_socket.recv(16).decode().strip()
-                if not size_data:
-                    logger.error(f"Client {client_id} sent empty size data")
-                    continue
+                # 2. Chunked weight-delta payload
+                data = recv_chunked(client_socket)
 
-                size = int(size_data)
-
-                # Receive weight update
-                data = b""
-                while len(data) < size:
-                    chunk = client_socket.recv(min(BUFFER_SIZE, size - len(data)))
-                    if not chunk:
-                        break
-                    data += chunk
-
-                # Deserialize weight delta
+                # 3. Deserialize
                 weight_delta = deserialize_weights(data)
 
                 received_updates[client_id] = {
@@ -188,23 +323,28 @@ class FederatedServer:
                     "steps": steps,
                     "client_socket": client_socket,
                 }
-
                 self.client_info[client_id]["n_samples"] = n_samples
                 self.client_info[client_id]["steps"] = steps
+
                 logger.info(
                     f"Received update from client {client_id}: "
-                    f"{n_samples} samples, {steps} steps"
+                    f"{n_samples} samples, {steps} steps, "
+                    f"{len(data):,} bytes"
                 )
 
             except Exception as e:
                 logger.error(f"Error receiving update from client {client_id}: {e}")
+                self.client_info[client_id]["connected"] = False
 
         elapsed = time.time() - start_time
         logger.info(
-            f"Received updates from {len(received_updates)} clients in {elapsed:.2f}s"
+            f"Received updates from {len(received_updates)} client(s) in {elapsed:.1f}s"
         )
-
         return received_updates
+
+    # ------------------------------------------------------------------
+    # FedNova Aggregation
+    # ------------------------------------------------------------------
 
     def fednova_aggregation(self, client_updates):
         """
@@ -265,6 +405,10 @@ class FederatedServer:
 
         return self.global_weights
 
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
     def run_federated_training(self):
         """Run the main federated training loop."""
         logger.info("=" * 60)
@@ -281,7 +425,9 @@ class FederatedServer:
             logger.info(f"{'=' * 60}")
 
             # Step 1: Broadcast global weights
-            self.broadcast_global_weights()
+            if not self.broadcast_global_weights():
+                logger.error("Broadcast failed to all clients. Aborting.")
+                break
 
             # Step 2: Receive client updates
             client_updates = self.receive_client_updates()
@@ -337,7 +483,7 @@ class FederatedServer:
         for client_socket in self.clients:
             try:
                 client_socket.close()
-            except:
+            except Exception:
                 pass
 
         if self.server_socket:
