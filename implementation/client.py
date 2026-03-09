@@ -7,15 +7,64 @@ import time
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# TF compat patch: older TF builds on Jetson Nano are missing this attribute.
-# Must run before any model.fit() call.
+# Force CPU-only training on the Jetson Nano.
+#
+# The Nano's 128-core Maxwell GPU shares system RAM and only exposes ~102 MB
+# to TF's BFC allocator — not enough for forward + backward passes of the
+# 4096→1024 Dense layer.  Setting CUDA_VISIBLE_DEVICES *before* TF is
+# imported makes TF skip GPU init entirely.  The 1.9 GB of free system RAM
+# is more than sufficient for CPU training.
+# ---------------------------------------------------------------------------
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+# ---------------------------------------------------------------------------
+# TF compat patch for Jetson Nano (older TF 2.x builds).
+#
+# Keras' model.fit() with class_weight triggers code paths through
+# tf.__internal__.distribute that reference three attributes which may be
+# absent on older builds:
+#
+#   1. strategy_supports_no_merge_call  – function returning bool
+#   2. interim.maybe_merge_call         – routes fn through merge_call or
+#                                         calls it directly
+#   3. variable_sync_on_read_context    – context manager for SyncOnRead vars
+#
+# On a single-device Nano none of these are actually needed, so we provide
+# safe no-op stubs.  Must run before any model.fit() call.
 # ---------------------------------------------------------------------------
 try:
+    import contextlib
+    import types
     import tensorflow.compat.v2 as _tf2
 
     _dist = _tf2.__internal__.distribute
+
+    # 1. strategy_supports_no_merge_call
     if not hasattr(_dist, "strategy_supports_no_merge_call"):
         _dist.strategy_supports_no_merge_call = lambda: False
+
+    # 2. interim  (sub-module with maybe_merge_call)
+    if not hasattr(_dist, "interim"):
+        _interim = types.ModuleType("tensorflow.__internal__.distribute.interim")
+        # On single-device, just call fn(strategy, ...) directly — no merge_call
+        _interim.maybe_merge_call = lambda fn, strategy, *args, **kwargs: fn(
+            strategy, *args, **kwargs
+        )
+        _dist.interim = _interim
+    elif not hasattr(_dist.interim, "maybe_merge_call"):
+        _dist.interim.maybe_merge_call = lambda fn, strategy, *args, **kwargs: fn(
+            strategy, *args, **kwargs
+        )
+
+    # 3. variable_sync_on_read_context  (no-op context manager)
+    if not hasattr(_dist, "variable_sync_on_read_context"):
+
+        @contextlib.contextmanager
+        def _noop_sync_ctx():
+            yield
+
+        _dist.variable_sync_on_read_context = _noop_sync_ctx
+
 except Exception:
     pass
 from config import (
