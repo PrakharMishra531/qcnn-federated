@@ -5,6 +5,19 @@ import socket
 import time
 
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# TF compat patch: older TF builds on Jetson Nano are missing this attribute.
+# Must run before any model.fit() call.
+# ---------------------------------------------------------------------------
+try:
+    import tensorflow.compat.v2 as _tf2
+
+    _dist = _tf2.__internal__.distribute
+    if not hasattr(_dist, "strategy_supports_no_merge_call"):
+        _dist.strategy_supports_no_merge_call = lambda: False
+except Exception:
+    pass
 from config import (
     BATCH_SIZE,
     BUFFER_SIZE,
